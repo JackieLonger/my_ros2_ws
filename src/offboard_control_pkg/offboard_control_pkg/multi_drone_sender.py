@@ -50,6 +50,14 @@ class MissionControl(Node):
         self.best_positions = {1: None, 2: None}  # 最佳訊號位置：{"position": (x,y,z), "avg_snr": 10.5, ...}
         # 即時 CSV 紀錄檔（掃描開始時建立）：{drone_id: csv_path}
         self.scan_csv_paths = {1: None, 2: None}
+
+        # 設定 CSV 紀錄目錄至工作區: my_ros2_ws/signal_log
+        # 若目錄不存在則建立
+        self.log_dir = "/home/jackiehp/my_ros2_ws/signal_log"
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         for did in self.ids:
@@ -424,13 +432,13 @@ class MissionControl(Node):
 
         # 為本次掃描建立每機 CSV 檔案
         try:
-            os.makedirs(os.path.expanduser('~/signal_logs'), exist_ok=True)
+            os.makedirs(self.log_dir, exist_ok=True)
         except Exception:
             pass
         session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         for did in targets:
-            path = os.path.expanduser(f"~/signal_logs/flight_{session_ts}_drone{did}.csv")
+            path = os.path.join(self.log_dir, f"flight_{session_ts}_drone{did}.csv")
             self.scan_csv_paths[did] = path
             try:
                 with open(path, 'w', newline='') as f:
@@ -621,8 +629,8 @@ class MissionControl(Node):
         """將每架無人機的訊號歷史記錄匯出為獨立的 CSV 檔案"""
         print(f"\n{Colors.YELLOW}>>> 開始匯出訊號歷史...{Colors.ENDC}")
         
-        # 創建 signal_logs 目錄
-        log_dir = os.path.expanduser("~/signal_logs")
+        # 使用工作區的 signal_log 目錄
+        log_dir = self.log_dir
         os.makedirs(log_dir, exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
