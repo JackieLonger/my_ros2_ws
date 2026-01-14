@@ -16,7 +16,19 @@ class Colors:
 class MissionControl(Node):
     def __init__(self):
         super().__init__('mission_control')
-        self.ids = [1, 2]
+        # 以 ROS 參數 drone_ids 支援多台無人機，預設 "1,2"
+        self.declare_parameter('drone_ids', '1,2')
+        ids_raw = self.get_parameter('drone_ids').get_parameter_value().string_value
+        parsed_ids = []
+        try:
+            for token in ids_raw.split(','):
+                token = token.strip()
+                if token.isdigit():
+                    parsed_ids.append(int(token))
+        except Exception:
+            parsed_ids = []
+        # 去重與排序，並提供預設
+        self.ids = sorted(set(parsed_ids)) if parsed_ids else [1, 2]
         self.target_mode = "ALL"
         
         # 參數設定
@@ -38,18 +50,18 @@ class MissionControl(Node):
         self.link_quality_subs = {}  # 訊號品質訂閱
         
         # 掃描狀態變數
-        self.scan_ready_flags = {1: False, 2: False}  # 記錄每架無人機的掃描完成狀態
-        self.mission_stop = False  # 任務停止標誌，用於中斷正在執行的任務
-        self.scan_stop = False     # 掃描停止標誌，用於中斷網格掃描
+        self.scan_ready_flags = {did: False for did in self.ids}  # 記錄每架無人機的掃描完成狀態
+        self.mission_stop_flags = {did: False for did in self.ids}  # 任務停止標誌（per-drone）
+        self.scan_stop_flags = {did: False for did in self.ids}     # 掃描停止標誌（per-drone）
         
         # 歷史訊號記錄：{drone_id: [{"position": (x,y,z), "tracker_id": "!xxx", "snr": 8.5, "rssi": -85, ...}, ...]}
-        self.signal_history = {1: [], 2: []}
-        self.current_scan_position = {1: (0.0, 0.0, -5.0), 2: (0.0, 0.0, -5.0)}  # 當前掃描位置
-        self.current_scan_phase = {1: 'INIT', 2: 'INIT'}  # 當前掃描階段
-        self.scan_origin = {1: (0.0, 0.0), 2: (0.0, 0.0)}  # 掃描原點
-        self.best_positions = {1: None, 2: None}  # 最佳訊號位置：{"position": (x,y,z), "avg_snr": 10.5, ...}
+        self.signal_history = {did: [] for did in self.ids}
+        self.current_scan_position = {did: (0.0, 0.0, -5.0) for did in self.ids}  # 當前掃描位置
+        self.current_scan_phase = {did: 'INIT' for did in self.ids}  # 當前掃描階段
+        self.scan_origin = {did: (0.0, 0.0) for did in self.ids}  # 掃描原點
+        self.best_positions = {did: None for did in self.ids}  # 最佳訊號位置：{"position": (x,y,z), "avg_snr": 10.5, ...}
         # 即時 CSV 紀錄檔（掃描開始時建立）：{drone_id: csv_path}
-        self.scan_csv_paths = {1: None, 2: None}
+        self.scan_csv_paths = {did: None for did in self.ids}
 
         # 設定 CSV 紀錄目錄至工作區: my_ros2_ws/signal_log
         # 若目錄不存在則建立
@@ -88,7 +100,8 @@ class MissionControl(Node):
         print(f"[L]     降落 (Land)")
         print(f"[R]     上鎖重置 (Disarm) - 降落後必按")
         print(f"--------------------------------------------")
-        print(f"[1/2/A] 切換飛機")
+        ids_hint = "/".join(str(d) for d in self.ids)
+        print(f"[{ids_hint}/A] 切換飛機")
         print(f"[Ctrl+C] 離開")
 
     def set_target(self, mode):
@@ -255,6 +268,10 @@ class MissionControl(Node):
         for did in targets: 
             self.scan_action_pubs[did].publish(msg)
 
+    def send_scan_action_per_drone(self, did, action):
+        msg = String(); msg.data = action
+        self.scan_action_pubs[did].publish(msg)
+
     def send_action(self, action):
         targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         msg = String(); msg.data = action
@@ -273,12 +290,13 @@ class MissionControl(Node):
     def perform_takeoff(self):
         print(f"\n{Colors.YELLOW}>>> 執行起飛程序...{Colors.ENDC}")
         
-        # 停止任何掃描
-        self.scan_stop = True
+        # 停止任何掃描（僅針對當前目標）
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        for did in targets:
+            self.scan_stop_flags[did] = True
         self.send_scan_action("STOP_SCAN")
         
         # 重置原點與掃描相關數據
-        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         for did in targets:
             self.current_scan_position[did] = (0.0, 0.0, self.takeoff_height)
             self.current_scan_phase[did] = 'INIT'
@@ -299,11 +317,12 @@ class MissionControl(Node):
 
     # --- 功能 2: 執行移動任務 ---
     def perform_mission(self):
-        # 停止任何掃描
-        self.scan_stop = True
+        # 停止任何掃描（僅針對當前目標）
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        for did in targets:
+            self.scan_stop_flags[did] = True
         self.send_scan_action("STOP_SCAN")
         # 重置原點與掃描相關數據
-        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         for did in targets:
             self.current_scan_position[did] = (0.0, 0.0, self.takeoff_height)
             self.current_scan_phase[did] = 'INIT'
@@ -314,9 +333,10 @@ class MissionControl(Node):
         
         print(f"{Colors.GREEN}>>> 已重置原點與掃描數據{Colors.ENDC}")
         
-        # 重置任務停止與掃描停止標誌
-        self.mission_stop = False
-        self.scan_stop = True
+        # 重置任務停止標誌（僅針對當前目標）
+        for did in targets:
+            self.mission_stop_flags[did] = False
+            self.scan_stop_flags[did] = True
         
         def mission_thread():
             print(f"\n{Colors.YELLOW}>>> 開始執行移動任務...{Colors.ENDC}")
@@ -325,7 +345,7 @@ class MissionControl(Node):
             self.send_action("RESET_ORIGIN")
             self.send_action("TAKEOFF_CHECK")
             time.sleep(5.0)
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
             # 使用各無人機當前高度，不再強制重設高度
             z_current = {}
@@ -337,7 +357,7 @@ class MissionControl(Node):
             for did in targets:
                 self.send_setpoint_per_drone(did, self.move_front, 0.0, z_current[did])
             time.sleep(8.0) # 等待飛行
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
 
             #back
@@ -345,7 +365,7 @@ class MissionControl(Node):
             for did in targets:
                 self.send_setpoint_per_drone(did, -self.move_back, 0.0, z_current[did])
             time.sleep(8.0)
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
 
             #left
@@ -353,7 +373,7 @@ class MissionControl(Node):
             for did in targets:
                 self.send_setpoint_per_drone(did, 0.0, self.move_left, z_current[did])
             time.sleep(8.0)
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
             
             #right
@@ -361,7 +381,7 @@ class MissionControl(Node):
             for did in targets:
                 self.send_setpoint_per_drone(did, 0.0, -self.move_right, z_current[did])
             time.sleep(8.0)
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
 
             # 2. 返回
@@ -369,7 +389,7 @@ class MissionControl(Node):
             for did in targets:
                 self.send_setpoint_per_drone(did, 0.0, 0.0, z_current[did])
             time.sleep(8.0)
-            if self.mission_stop:
+            if any(self.mission_stop_flags[did] for did in targets):
                 return
             
             print(f"{Colors.GREEN}>>> 移動結束，目前懸停中{Colors.ENDC}")
@@ -382,16 +402,17 @@ class MissionControl(Node):
     def perform_land(self):
         print(f"\n{Colors.RED}>>> 執行降落...{Colors.ENDC}")
         
-        # 停止正在執行的任務
-        self.mission_stop = True
-        self.scan_stop = True
+        # 停止正在執行的任務（僅針對當前目標）
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        for did in targets:
+            self.mission_stop_flags[did] = True
+            self.scan_stop_flags[did] = True
         self.send_scan_action("STOP_SCAN")
         time.sleep(0.5)  # 等待執行緒檢查標誌
         
         self.send_action("LAND")
         
         # 降落時重置原點與掃描相關數據
-        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         for did in targets:
             self.current_scan_position[did] = (0.0, 0.0, self.takeoff_height)
             self.current_scan_phase[did] = 'INIT'
@@ -422,13 +443,17 @@ class MissionControl(Node):
         3. 每次移動後，啟動掃描並等待所有無人機報告掃描完成
         4. 掃描完成後，移動到最佳位置並重新掃描驗證
         """
-        # 開始新的掃描：停止任何正在執行的移動任務，清除掃描停止標誌
-        self.mission_stop = True
-        self.scan_stop = False
+        # 開始新的掃描：停止任何正在執行的移動任務，清除掃描停止標誌（僅針對當前目標）
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        for did in targets:
+            self.mission_stop_flags[did] = True
+            self.scan_stop_flags[did] = False
         # 重置原點（Drone端會將原點設為當前位置，避免掃描開始時座標偏移）
         self.send_action("RESET_ORIGIN")
         # 保險起見，停止上一輪掃描
         self.send_scan_action("STOP_SCAN")
+        
+        # 注意：targets 在這裡已經定義，下面不用再定義
 
         # 為本次掃描建立每機 CSV 檔案
         try:
@@ -436,7 +461,6 @@ class MissionControl(Node):
         except Exception:
             pass
         session_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
         for did in targets:
             path = os.path.join(self.log_dir, f"flight_{session_ts}_drone{did}.csv")
             self.scan_csv_paths[did] = path
@@ -481,7 +505,7 @@ class MissionControl(Node):
             # 階段 1: 網格掃描
             print(f"{Colors.GREEN}【階段 1/2】網格掃描{Colors.ENDC}\n")
             for i, (x, y, phase) in enumerate(scan_points, 1):
-                if self.scan_stop:
+                if any(self.scan_stop_flags[did] for did in targets):
                     print(f"{Colors.RED}>>> 掃描中止{Colors.ENDC}")
                     return
                 print(f"{Colors.YELLOW}--- 點 {i}/4: [{phase}] ({x:.1f}, {y:.1f}) ---{Colors.ENDC}")
@@ -497,12 +521,12 @@ class MissionControl(Node):
                 
                 print(f">>> 等待飛行到位... (5秒)")
                 time.sleep(5.0)
-                if self.scan_stop:
+                if any(self.scan_stop_flags[did] for did in targets):
                     print(f"{Colors.RED}>>> 掃描中止{Colors.ENDC}")
                     return
                 
-                # 2. 清空之前的掃描狀態
-                for did in self.scan_ready_flags:
+                # 2. 清空之前的掃描狀態（僅針對當前目標）
+                for did in targets:
                     self.scan_ready_flags[did] = False
                 
                 # 3. 啟動掃描
@@ -514,7 +538,7 @@ class MissionControl(Node):
                 start_time = time.time()
                 
                 while time.time() - start_time < self.scan_timeout:
-                    if self.scan_stop:
+                    if any(self.scan_stop_flags[did] for did in targets):
                         print(f"{Colors.RED}>>> 掃描中止{Colors.ENDC}")
                         return
                     if all(self.scan_ready_flags.get(did, False) for did in targets):
@@ -546,8 +570,8 @@ class MissionControl(Node):
                 print(f">>> 移動到最佳位置 {best_pos}")
                 print(f"    (歷史綜合評分: {best['combined_score']:.3f}, SNR: {best['avg_snr']:.1f}dB, RSSI: {best['avg_rssi']:.1f}dBm)")
                 
-                # 1. 移動到最佳位置
-                self.send_setpoint(x, y, z)
+                # 1. 移動到最佳位置（僅針對該無人機）
+                self.send_setpoint_per_drone(drone_id, x, y, z)
                 self.current_scan_position[drone_id] = best_pos
                 self.current_scan_phase[drone_id] = "VERIFY"
                 print(f">>> 等待飛行到位... (5秒)")
@@ -556,9 +580,9 @@ class MissionControl(Node):
                 # 2. 清空掃描狀態
                 self.scan_ready_flags[drone_id] = False
                 
-                # 3. 啟動驗證掃描
+                # 3. 啟動驗證掃描（僅針對該無人機）
                 print(f">>> 啟動驗證掃描...")
-                self.send_scan_action("START_SCAN")
+                self.send_scan_action_per_drone(drone_id, "START_SCAN")
                 
                 # 4. 等待掃描完成
                 print(f">>> 等待掃描完成... (最多 {self.scan_timeout:.0f}秒)")
@@ -574,8 +598,8 @@ class MissionControl(Node):
                 else:
                     print(f"{Colors.RED}>>> ⚠️  Drone {drone_id} 掃描超時{Colors.ENDC}")
                 
-                # 5. 停止掃描
-                self.send_scan_action("STOP_SCAN")
+                # 5. 停止掃描（僅針對該無人機）
+                self.send_scan_action_per_drone(drone_id, "STOP_SCAN")
                 
                 # 6. 比較驗證結果
                 print(f"\n{Colors.YELLOW}>>> 驗證結果比較:{Colors.ENDC}")
@@ -611,9 +635,10 @@ class MissionControl(Node):
                         print(f"    {Colors.YELLOW}⚠️  訊號差異較大 (誤差 {diff:+.3f}){Colors.ENDC}")
                 print("")
             
-            # 返回起點
+            # 返回起點（各自回到起始高度）
             print(f"{Colors.GREEN}>>> 返回起點...{Colors.ENDC}")
-            self.send_setpoint(base_x, base_y, z)
+            for did in targets:
+                self.send_setpoint_per_drone(did, base_x, base_y, z_current[did])
             time.sleep(5.0)
             
             print(f"\n{Colors.GREEN}{'='*60}{Colors.ENDC}")
@@ -702,8 +727,10 @@ def main(args=None):
     try:
         while rclpy.ok():
             key = get_key()
-            if key == '1': node.set_target(1)
-            elif key == '2': node.set_target(2)
+            if key.isdigit():
+                did = int(key)
+                if did in node.ids:
+                    node.set_target(did)
             elif key == 'a' or key == 'A': node.set_target("ALL")
             
             elif key == 't' or key == 'T': node.perform_takeoff()  # 獨立起飛
