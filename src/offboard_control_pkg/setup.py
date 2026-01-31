@@ -28,7 +28,8 @@ setup(
             'multi_drone_sender = offboard_control_pkg.multi_drone_sender:main',
             'fast_scan_node = offboard_control_pkg.fast_scan_node:main',
             'signal_sim_node = offboard_control_pkg.signal_sim_node:main',
-            'swarm_controller_node = offboard_control_pkg.swarm_controller_node:main',
+            'swarm_controller = offboard_control_pkg.swarm_controller:main',
+            "voice_commander = offboard_control_pkg.voice_commander:main",
         ],
     },
 )

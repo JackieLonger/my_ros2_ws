@@ -212,7 +212,7 @@ class DroneNode(Node):
         pos_ned = [
             float(self.origin_ref_ned[0] + x),
             float(self.origin_ref_ned[1] + y),
-            float(z)
+            float(self.origin_ref_ned[2] + z)
         ]
         msg.position = pos_ned
         msg.yaw = float('nan')
