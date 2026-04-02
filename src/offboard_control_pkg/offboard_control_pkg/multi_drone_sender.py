@@ -1,9 +1,11 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from rclpy.action import ActionClient
+from std_msgs.msg import String, Float64
 from geometry_msgs.msg import Point
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-import sys, termios, tty, time
+from mission_interfaces.action import CircleMission
+import sys, termios, tty, time, select, math
 import threading
 import json
 import csv
@@ -45,6 +47,7 @@ class MissionControl(Node):
         
         self.action_pubs = {}
         self.setpoint_pubs = {}
+        self.yaw_pubs = {}
         self.scan_action_pubs = {}  # 掃描控制
         self.scan_ready_subs = {}   # 掃描完成通知
         self.link_quality_subs = {}  # 訊號品質訂閱
@@ -63,6 +66,14 @@ class MissionControl(Node):
         # 即時 CSV 紀錄檔（掃描開始時建立）：{drone_id: csv_path}
         self.scan_csv_paths = {did: None for did in self.ids}
 
+        # 手動鍵盤控制模式
+        self.manual_mode = False
+        self.manual_position = {did: [0.0, 0.0, self.takeoff_height] for did in self.ids}
+        self.manual_yaw = {did: 0.0 for did in self.ids}  # NED radians
+        self.position_step = 0.5  # 每次按鍵移動距離（公尺）
+        self.yaw_step = 0.2       # ~11.5° per keypress
+        self.manual_bounds = {'x': (-20.0, 20.0), 'y': (-20.0, 20.0), 'z': (1.0, 15.0)}
+
         # 設定 CSV 紀錄目錄至工作區: my_ros2_ws/signal_log
         # 若目錄不存在則建立
         self.log_dir = "/home/jackiehp/my_ros2_ws/signal_log"
@@ -70,22 +81,39 @@ class MissionControl(Node):
             os.makedirs(self.log_dir, exist_ok=True)
         except Exception:
             pass
-        
+
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         for did in self.ids:
             self.action_pubs[did] = self.create_publisher(String, f'/px4_{did}/laptop/action', qos)
             self.setpoint_pubs[did] = self.create_publisher(Point, f'/px4_{did}/laptop/setpoint', qos)
+            self.yaw_pubs[did] = self.create_publisher(Float64, f'/px4_{did}/laptop/yaw_setpoint', qos)
             self.scan_action_pubs[did] = self.create_publisher(String, f'/px4_{did}/laptop/scan_action', qos)
             self.scan_ready_subs[did] = self.create_subscription(
-                String, f'/px4_{did}/scan_ready', 
+                String, f'/px4_{did}/scan_ready',
                 lambda msg, drone_id=did: self.scan_ready_cb(msg, drone_id), qos
             )
             self.link_quality_subs[did] = self.create_subscription(
                 String, f'/px4_{did}/link_quality',
                 lambda msg, drone_id=did: self.link_quality_cb(msg, drone_id), qos
             )
-        
+
+        # Circle mission Action clients
+        self.circle_action_clients = {
+            did: ActionClient(self, CircleMission, f'/px4_{did}/circle_mission/execute')
+            for did in self.ids
+        }
+        self.circle_active = False
+        self.circle_goal_handle = None
+
+        # Background spin thread (for Action callbacks)
+        self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
+        self._spin_thread.start()
+
         self.print_ui()
+
+    def _spin_loop(self):
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
 
     def print_ui(self):
         print("\033c", end="")
@@ -96,16 +124,21 @@ class MissionControl(Node):
         print(f"[T]     起飛 (Takeoff) -> 懸停")
         print(f"[Space] 開始移動 (Mission: 前進->返回)")
         print(f"{Colors.YELLOW}[F]     網格掃描+驗證 (Scan+Verify){Colors.ENDC}")
+        print(f"{Colors.YELLOW}[C]     畫圓任務 (Circle: Commander → Target){Colors.ENDC}")
+        print(f"{Colors.YELLOW}[Q]     取消畫圓任務{Colors.ENDC}")
         print(f"[H]     匯出歷史為CSV檔案")
         print(f"[L]     降落 (Land)")
         print(f"[R]     上鎖重置 (Disarm) - 降落後必按")
+        print(f"{Colors.YELLOW}[M]     手動鍵盤控制 (Manual Mode){Colors.ENDC}")
         print(f"--------------------------------------------")
         ids_hint = "/".join(str(d) for d in self.ids)
-        print(f"[{ids_hint}/A] 切換飛機")
+        print(f"[{ids_hint}/5] 切換飛機 (5=全體)")
         print(f"[Ctrl+C] 離開")
 
     def set_target(self, mode):
-        self.target_mode = mode; self.print_ui()
+        self.target_mode = mode
+        if not self.manual_mode:
+            self.print_ui()
     
     def scan_ready_cb(self, msg, drone_id):
         """接收無人機掃描完成通知"""
@@ -285,6 +318,125 @@ class MissionControl(Node):
     def send_setpoint_per_drone(self, did, x, y, z):
         msg = Point(); msg.x = float(x); msg.y = float(y); msg.z = float(z)
         self.setpoint_pubs[did].publish(msg)
+
+    def send_yaw_per_drone(self, did, yaw_rad):
+        msg = Float64(); msg.data = float(yaw_rad)
+        self.yaw_pubs[did].publish(msg)
+
+    # --- 手動鍵盤控制模式 ---
+    def print_manual_ui(self):
+        """顯示手動控制介面"""
+        print("\033c", end="")
+        target_str = "【全體 All】" if self.target_mode == "ALL" else f"【單機 ID: {self.target_mode}】"
+        print(f"{Colors.HEADER}=== 手動鍵盤控制模式 ==={Colors.ENDC}")
+        print(f"當前控制: {Colors.GREEN}{target_str}{Colors.ENDC}")
+        print(f"位置步進: {Colors.YELLOW}{self.position_step:.2f} m{Colors.ENDC}  偏航步進: {Colors.YELLOW}{math.degrees(self.yaw_step):.1f}°{Colors.ENDC}")
+        print(f"--------------------------------------------")
+        # 顯示各無人機位置與 yaw
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        for did in targets:
+            pos = self.manual_position[did]
+            yaw_deg = math.degrees(self.manual_yaw[did])
+            print(f"  Drone {did}: [{pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f}] Yaw={yaw_deg:+.1f}°")
+        print(f"--------------------------------------------")
+        print(f"[W/S] 前進/後退 (Y±)   [A/D] 左移/右移 (X±)")
+        print(f"[↑/↓] 上升/下降 (Z±)   [←/→] 偏航左/右轉")
+        print(f"[Y] 懸停 HOLD          [+/-] 調整步進")
+        print(f"[L] 緊急降落  [R] 緊急上鎖")
+        ids_hint = "/".join(str(d) for d in self.ids)
+        print(f"[{ids_hint}/5] 切換飛機")
+        print(f"[M] 退出手動模式")
+
+    def enter_manual_mode(self):
+        """進入手動模式：停止任務、重置原點、懸停、初始化位置"""
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        # 停止選定目標的任務
+        for did in targets:
+            self.mission_stop_flags[did] = True
+            self.scan_stop_flags[did] = True
+        self.send_scan_action("STOP_SCAN")
+        time.sleep(0.3)
+        # 重置原點 → 當前 NED 位置變為新原點
+        for did in targets:
+            msg = String(); msg.data = "RESET_ORIGIN"
+            self.action_pubs[did].publish(msg)
+        time.sleep(0.3)
+        # 發送 setpoint(0, 0, takeoff_height) → 懸停在當前位置，yaw=0
+        for did in targets:
+            self.send_setpoint_per_drone(did, 0.0, 0.0, self.takeoff_height)
+            self.manual_position[did] = [0.0, 0.0, self.takeoff_height]
+            self.manual_yaw[did] = 0.0
+            self.send_yaw_per_drone(did, 0.0)
+            self.current_scan_position[did] = (0.0, 0.0, self.takeoff_height)
+        self.print_manual_ui()
+
+    def sync_manual_position(self):
+        """切換目標時同步手動位置顯示（位置已存在 manual_position 中，不需重新初始化）"""
+        pass
+
+    def handle_manual_key(self, key):
+        """處理手動模式按鍵"""
+        targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
+        delta = [0.0, 0.0, 0.0]
+        yaw_delta = 0.0
+        step = self.position_step
+
+        if key in ('w', 'W'):
+            delta[1] = step    # 前進 +Y
+        elif key in ('s', 'S'):
+            delta[1] = -step   # 後退 -Y
+        elif key in ('a', 'A'):
+            delta[0] = -step   # 左移 -X
+        elif key in ('d', 'D'):
+            delta[0] = step    # 右移 +X
+        elif key == 'UP':
+            delta[2] = step    # 上升 +Z
+        elif key == 'DOWN':
+            delta[2] = -step   # 下降 -Z
+        elif key == 'LEFT':
+            yaw_delta = -self.yaw_step  # 偏航左轉
+        elif key == 'RIGHT':
+            yaw_delta = self.yaw_step   # 偏航右轉
+        elif key in ('y', 'Y'):
+            # HOLD：重發當前 position + yaw
+            for did in targets:
+                pos = self.manual_position[did]
+                self.send_setpoint_per_drone(did, pos[0], pos[1], pos[2])
+                self.send_yaw_per_drone(did, self.manual_yaw[did])
+            self.print_manual_ui()
+            return
+        elif key in ('+', '='):
+            self.position_step = min(5.0, self.position_step + 0.25)
+            self.yaw_step = min(math.radians(45), self.yaw_step + math.radians(5))
+            self.print_manual_ui()
+            return
+        elif key == '-':
+            self.position_step = max(0.1, self.position_step - 0.25)
+            self.yaw_step = max(math.radians(5), self.yaw_step - math.radians(5))
+            self.print_manual_ui()
+            return
+        else:
+            return  # 未知按鍵，忽略
+
+        if delta == [0.0, 0.0, 0.0] and yaw_delta == 0.0:
+            return
+
+        bounds = self.manual_bounds
+        for did in targets:
+            pos = self.manual_position[did]
+            pos[0] = max(bounds['x'][0], min(bounds['x'][1], pos[0] + delta[0]))
+            pos[1] = max(bounds['y'][0], min(bounds['y'][1], pos[1] + delta[1]))
+            pos[2] = max(bounds['z'][0], min(bounds['z'][1], pos[2] + delta[2]))
+            self.send_setpoint_per_drone(did, pos[0], pos[1], pos[2])
+            self.current_scan_position[did] = (pos[0], pos[1], pos[2])
+
+            if yaw_delta != 0.0:
+                self.manual_yaw[did] += yaw_delta
+                # Wrap to [-pi, pi]
+                self.manual_yaw[did] = math.atan2(math.sin(self.manual_yaw[did]), math.cos(self.manual_yaw[did]))
+                self.send_yaw_per_drone(did, self.manual_yaw[did])
+
+        self.print_manual_ui()
 
     # --- 功能 1: 僅起飛 ---
     def perform_takeoff(self):
@@ -649,6 +801,116 @@ class MissionControl(Node):
         t = threading.Thread(target=scan_thread)
         t.start()
     
+    # --- 功能 8: 畫圓任務 ---
+    def perform_circle_mission(self):
+        """Interactive circle mission: ask for Commander and Target IDs, send Action goal."""
+        if self.circle_active:
+            print(f"{Colors.RED}>>> 畫圓任務進行中，請先按 [Q] 取消{Colors.ENDC}")
+            return
+
+        # Temporarily restore terminal for input
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            # Ask Commander ID
+            print(f"\n{Colors.YELLOW}>>> 畫圓任務設定{Colors.ENDC}")
+            ids_str = "/".join(str(d) for d in self.ids)
+            print(f"Commander ID? [{ids_str}]: ", end="", flush=True)
+            tty.setraw(fd)
+            cmd_key = sys.stdin.read(1)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            print(cmd_key)
+
+            if not cmd_key.isdigit() or int(cmd_key) not in self.ids:
+                print(f"{Colors.RED}>>> 無效的 Commander ID{Colors.ENDC}")
+                time.sleep(1)
+                self.print_ui()
+                return
+            commander_id = int(cmd_key)
+
+            # Ask Target ID
+            print(f"Target ID? [{ids_str}]: ", end="", flush=True)
+            tty.setraw(fd)
+            tgt_key = sys.stdin.read(1)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            print(tgt_key)
+
+            if not tgt_key.isdigit() or int(tgt_key) not in self.ids:
+                print(f"{Colors.RED}>>> 無效的 Target ID{Colors.ENDC}")
+                time.sleep(1)
+                self.print_ui()
+                return
+            target_id = int(tgt_key)
+
+            if commander_id == target_id:
+                print(f"{Colors.RED}>>> Commander 和 Target 不能相同！{Colors.ENDC}")
+                time.sleep(1)
+                self.print_ui()
+                return
+
+        except Exception:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            self.print_ui()
+            return
+
+        # Send Action goal to Commander's action server
+        client = self.circle_action_clients.get(commander_id)
+        if client is None:
+            print(f"{Colors.RED}>>> 找不到 Commander {commander_id} 的 Action Client{Colors.ENDC}")
+            return
+
+        if not client.wait_for_server(timeout_sec=3.0):
+            print(f"{Colors.RED}>>> Commander {commander_id} 的 Action Server 未就緒{Colors.ENDC}")
+            return
+
+        goal = CircleMission.Goal()
+        goal.commander_id = commander_id
+        goal.target_id = target_id
+        goal.diameter = 3.0
+        goal.omega = 0.5
+
+        print(f"\n{Colors.GREEN}>>> 畫圓任務已發送：Commander={commander_id} → Target={target_id}{Colors.ENDC}")
+        print(f">>> 按 [Q] 取消任務\n")
+
+        self.circle_active = True
+        send_future = client.send_goal_async(goal, feedback_callback=self._circle_feedback_cb)
+        send_future.add_done_callback(self._circle_goal_response_cb)
+
+    def _circle_goal_response_cb(self, future):
+        """Callback when goal is accepted/rejected."""
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            print(f"{Colors.RED}>>> 畫圓任務被拒絕{Colors.ENDC}")
+            self.circle_active = False
+            return
+
+        self.circle_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._circle_result_cb)
+
+    def _circle_feedback_cb(self, feedback_msg):
+        """Display circle mission feedback."""
+        fb = feedback_msg.feedback
+        angle_deg = math.degrees(fb.angle_rad)
+        print(f"\r  [{fb.phase}] elapsed={fb.elapsed_sec:.1f}s angle={angle_deg:.0f}°    ", end="", flush=True)
+
+    def _circle_result_cb(self, future):
+        """Callback when circle mission completes."""
+        result = future.result().result
+        status_str = "成功" if result.success else "失敗/取消"
+        print(f"\n{Colors.GREEN}>>> 畫圓任務結束: {status_str} - {result.message} (耗時 {result.total_time_sec:.1f}s){Colors.ENDC}")
+        self.circle_active = False
+        self.circle_goal_handle = None
+
+    def cancel_circle_mission(self):
+        """Cancel the active circle mission."""
+        if not self.circle_active or self.circle_goal_handle is None:
+            print(f"{Colors.YELLOW}>>> 沒有進行中的畫圓任務{Colors.ENDC}")
+            return
+        print(f"\n{Colors.YELLOW}>>> 正在取消畫圓任務...{Colors.ENDC}")
+        self.circle_goal_handle.cancel_goal_async()
+
     # --- 功能 7: 匯出訊號歷史為 CSV ---
     def export_signal_history_csv(self):
         """將每架無人機的訊號歷史記錄匯出為獨立的 CSV 檔案"""
@@ -718,28 +980,66 @@ class MissionControl(Node):
     
 def get_key():
     fd = sys.stdin.fileno(); old = termios.tcgetattr(fd)
-    try: tty.setraw(fd); ch = sys.stdin.read(1)
-    finally: termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return ch
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            # 可能是方向鍵 escape sequence
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[' and select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch3 = sys.stdin.read(1)
+                    arrow_map = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
+                    if ch3 in arrow_map:
+                        return arrow_map[ch3]
+            return '\x1b'  # 單獨的 ESC
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 def main(args=None):
     rclpy.init(args=args); node = MissionControl()
     try:
         while rclpy.ok():
             key = get_key()
+            if key == '\x03': break
+
+            # 數字鍵切換目標 — 兩種模式都可用
             if key.isdigit():
                 did = int(key)
-                if did in node.ids:
+                if did == 5:
+                    # 5 = 切換全體
+                    node.set_target("ALL")
+                    if node.manual_mode:
+                        node.print_manual_ui()
+                elif did in node.ids:
                     node.set_target(did)
-            elif key == 'a' or key == 'A': node.set_target("ALL")
-            
-            elif key == 't' or key == 'T': node.perform_takeoff()  # 獨立起飛
-            elif key == ' ': node.perform_mission()                # 獨立移動
-            elif key == 'f' or key == 'F': node.perform_grid_scan()  # 網格掃描+驗證
-            elif key == 'h' or key == 'H': node.export_signal_history_csv()  # 匯出 CSV
-            elif key == 'l' or key == 'L': node.perform_land()     # 獨立降落
-            elif key == 'r' or key == 'R': node.perform_disarm()   # 獨立上鎖
-            
-            elif key == '\x03': break
+                    if node.manual_mode:
+                        node.print_manual_ui()
+
+            # M 切換手動模式
+            elif key in ('m', 'M'):
+                node.manual_mode = not node.manual_mode
+                if node.manual_mode:
+                    node.enter_manual_mode()
+                else:
+                    node.print_ui()
+
+            # 手動模式按鍵
+            elif node.manual_mode:
+                if key in ('l', 'L'): node.perform_land(); node.manual_mode = False
+                elif key in ('r', 'R'): node.perform_disarm(); node.manual_mode = False
+                else: node.handle_manual_key(key)
+
+            # 一般模式按鍵（原有功能不變）
+            else:
+                if key in ('t', 'T'): node.perform_takeoff()
+                elif key == ' ': node.perform_mission()
+                elif key in ('f', 'F'): node.perform_grid_scan()
+                elif key in ('c', 'C'): node.perform_circle_mission()
+                elif key in ('q', 'Q'): node.cancel_circle_mission()
+                elif key in ('h', 'H'): node.export_signal_history_csv()
+                elif key in ('l', 'L'): node.perform_land()
+                elif key in ('r', 'R'): node.perform_disarm()
     except KeyboardInterrupt: pass
     finally: node.destroy_node(); rclpy.shutdown()

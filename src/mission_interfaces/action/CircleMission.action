@@ -1,0 +1,15 @@
+# Goal
+uint8 commander_id
+uint8 target_id
+float32 diameter     # m, default 3.0
+float32 omega        # rad/s, default 0.5
+---
+# Result
+bool success
+string message
+float32 total_time_sec
+---
+# Feedback
+string phase           # HOVERING / MOVING_TO_EDGE / CIRCLING
+float32 elapsed_sec
+float32 angle_rad      # current angle during CIRCLING

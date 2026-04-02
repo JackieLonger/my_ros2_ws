@@ -14,10 +14,12 @@
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>python3-scikit-learn</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <depend>px4_msgs</depend>
+  <depend>mission_interfaces</depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -30,6 +30,7 @@ setup(
             'signal_sim_node = offboard_control_pkg.signal_sim_node:main',
             'swarm_controller = offboard_control_pkg.swarm_controller:main',
             "voice_commander = offboard_control_pkg.voice_commander:main",
+            'multi_drone_visualizer = offboard_control_pkg.multi_drone_visualizer:main',
         ],
     },
 )
