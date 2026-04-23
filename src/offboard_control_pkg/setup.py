@@ -23,7 +23,6 @@ setup(
         'console_scripts': [
             'offboard_control = offboard_control_pkg.offboard_control:main',
             'slam_launch = offboard_control_pkg.slam_launch:main',
-            'drone_node = offboard_control_pkg.drone_node:main',
             'real_drone_node = offboard_control_pkg.real_drone_node:main',
             'multi_drone_sender = offboard_control_pkg.multi_drone_sender:main',
             'fast_scan_node = offboard_control_pkg.fast_scan_node:main',

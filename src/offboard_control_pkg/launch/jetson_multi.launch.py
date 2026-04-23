@@ -41,7 +41,7 @@ def generate_launch_description():
         # Drone control node
         Node(
             package='offboard_control_pkg',
-            executable='drone_node',
+            executable='real_drone_node',
             name='drone_control_node',
             parameters=[{'drone_id': drone_id}],
             output='screen'

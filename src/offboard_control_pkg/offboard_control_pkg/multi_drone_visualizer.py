@@ -14,11 +14,14 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition, TrajectorySetpoint
+from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition, TrajectorySetpoint, VehicleGlobalPosition
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point, TransformStamped
 from nav_msgs.msg import Path
-from visualization_msgs.msg import Marker
+from sensor_msgs.msg import NavSatFix
+from visualization_msgs.msg import Marker, MarkerArray
+from mission_interfaces.msg import GlobalMission, RelayStatus
+from tf2_ros import TransformBroadcaster
 import json
 
 
@@ -67,6 +70,16 @@ class MultiDroneVisualizer(Node):
 
         cmd_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
+        # Latched QoS — for mission waypoints / progress / handoffs so late-joining
+        # Foxglove sessions still see them
+        latched_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._latched_qos = latched_qos
+
         # 每架無人機獨立狀態與 publisher
         self.drones = {}
         self.pubs = {}
@@ -92,6 +105,7 @@ class MultiDroneVisualizer(Node):
                 'setpoint_path': self.create_publisher(Path, f'{viz_ns}/setpoint_path', 10),
                 'vehicle_velocity': self.create_publisher(Marker, f'{viz_ns}/vehicle_velocity', 10),
                 'circle_reference': self.create_publisher(Marker, f'{viz_ns}/circle_reference', 10),
+                'navsat': self.create_publisher(NavSatFix, f'{viz_ns}/navsat', 10),
             }
 
             # 訂閱
@@ -119,6 +133,38 @@ class MultiDroneVisualizer(Node):
                 lambda msg, d=did: self.circle_ref_cb(msg, d),
                 cmd_qos
             )
+            self.create_subscription(
+                VehicleGlobalPosition,
+                f'{ns}/fmu/out/vehicle_global_position',
+                lambda msg, d=did: self.global_position_cb(msg, d),
+                px4_qos
+            )
+
+        # Mission waypoints / progress / handoff state
+        self.mission_waypoints = []            # [(lat, lon, alt), ...]
+        self.mission_wpt_publishers = []       # per-waypoint NavSatFix publishers (latched)
+        self.current_waypoint_index = -1
+        self.active_drone_id = 0
+        self.prev_phase_per_drone = {}         # did -> last phase string
+        self.handoff_points = []               # [(lat, lon), ...]
+        self.handoff_publishers = []           # per-handoff NavSatFix publishers (latched)
+
+        self.mission_markers_pub = self.create_publisher(
+            MarkerArray, '/multi_drone_viz/mission/waypoints_markers', latched_qos
+        )
+        self.progress_pub = self.create_publisher(
+            String, '/multi_drone_viz/mission/progress', latched_qos
+        )
+
+        self.create_subscription(
+            GlobalMission, '/swarm/global_mission', self.global_mission_cb, cmd_qos
+        )
+        self.create_subscription(
+            RelayStatus, '/swarm/relay_status', self.relay_status_cb, cmd_qos
+        )
+
+        # TF broadcaster: map -> drone_{did}_base_link
+        self.tf_broadcaster = TransformBroadcaster(self)
 
         # 20Hz publish timer
         self.create_timer(0.05, self.timer_callback)
@@ -186,6 +232,167 @@ class MultiDroneVisualizer(Node):
                 self.circle_refs[did] = None
         except Exception:
             pass
+
+    def global_position_cb(self, msg: VehicleGlobalPosition, did: int):
+        """Re-publish drone GPS as NavSatFix for Foxglove Map panel."""
+        fix = NavSatFix()
+        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.frame_id = 'map'
+        fix.latitude = float(msg.lat)
+        fix.longitude = float(msg.lon)
+        fix.altitude = float(msg.alt)
+        fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+        self.pubs[did]['navsat'].publish(fix)
+
+    def global_mission_cb(self, msg: GlobalMission):
+        """Receive planned mission, publish each waypoint as latched NavSatFix and 3D markers."""
+        n = min(len(msg.waypoint_lats), len(msg.waypoint_lons), len(msg.waypoint_alts))
+        if n == 0:
+            return
+        self.mission_waypoints = [
+            (float(msg.waypoint_lats[i]), float(msg.waypoint_lons[i]), float(msg.waypoint_alts[i]))
+            for i in range(n)
+        ]
+
+        # Create/extend per-waypoint NavSatFix publishers for Foxglove Map panel
+        while len(self.mission_wpt_publishers) < n:
+            k = len(self.mission_wpt_publishers)
+            self.mission_wpt_publishers.append(
+                self.create_publisher(
+                    NavSatFix, f'/multi_drone_viz/mission/waypoint_{k}', self._latched_qos
+                )
+            )
+
+        stamp = self.get_clock().now().to_msg()
+        for k, (lat, lon, alt) in enumerate(self.mission_waypoints):
+            fix = NavSatFix()
+            fix.header.stamp = stamp
+            fix.header.frame_id = 'map'
+            fix.latitude = lat
+            fix.longitude = lon
+            fix.altitude = alt
+            self.mission_wpt_publishers[k].publish(fix)
+
+        self._publish_mission_markers()
+        self.get_logger().info(
+            f"[MISSION] id={msg.mission_id} waypoints={n} altitude={msg.mission_altitude:.1f}m"
+        )
+
+    def relay_status_cb(self, msg: RelayStatus):
+        """Track progress, publish progress string, detect handoff events."""
+        phase = msg.phase
+        drone = int(msg.active_drone_id)
+        idx = int(msg.current_index)
+        total = int(msg.total_waypoints)
+
+        self.active_drone_id = drone
+        self.current_waypoint_index = idx
+
+        progress = String()
+        progress.data = f"Drone {drone} | WP {idx}/{total} | {phase}"
+        self.progress_pub.publish(progress)
+
+        # Re-publish mission markers with updated progress coloring
+        self._publish_mission_markers()
+
+        # Handoff detection: edge-triggered on entering RELAY_INTERRUPTED
+        prev = self.prev_phase_per_drone.get(drone)
+        if phase == 'RELAY_INTERRUPTED' and prev != 'RELAY_INTERRUPTED':
+            self._record_handoff(msg.current_lat, msg.current_lon)
+        self.prev_phase_per_drone[drone] = phase
+
+    def _record_handoff(self, lat: float, lon: float):
+        """Store a handoff point and publish it as a latched NavSatFix."""
+        k = len(self.handoff_points)
+        self.handoff_points.append((float(lat), float(lon)))
+        pub = self.create_publisher(
+            NavSatFix, f'/multi_drone_viz/handoffs/point_{k}', self._latched_qos
+        )
+        self.handoff_publishers.append(pub)
+        fix = NavSatFix()
+        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.frame_id = 'map'
+        fix.latitude = float(lat)
+        fix.longitude = float(lon)
+        fix.altitude = 0.0
+        pub.publish(fix)
+        self.get_logger().info(f"[HANDOFF] #{k} at ({lat:.7f}, {lon:.7f})")
+
+    def _publish_mission_markers(self):
+        """MarkerArray for 3D panel: waypoints spheres + route line + handoff markers.
+        Requires self.origin_lat to be set (from any drone's local_position_cb)."""
+        if self.origin_lat is None or not self.mission_waypoints:
+            return
+
+        arr = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        mission_z = 2.0  # display height in 3D panel (visual only)
+
+        for k, (lat, lon, alt) in enumerate(self.mission_waypoints):
+            east, north, _up = gps_offset_enu(
+                lat, lon, alt, self.origin_lat, self.origin_lon, self.origin_alt
+            )
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = 'map'
+            m.ns = 'mission_waypoints'
+            m.id = k
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(east)
+            m.pose.position.y = float(north)
+            m.pose.position.z = mission_z
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 1.2
+            if k < self.current_waypoint_index:
+                m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 1.0, 0.0, 0.8  # done
+            elif k == self.current_waypoint_index:
+                m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 0.0, 1.0  # current
+            else:
+                m.color.r, m.color.g, m.color.b, m.color.a = 0.5, 0.5, 0.5, 0.6  # pending
+            arr.markers.append(m)
+
+        line = Marker()
+        line.header.stamp = stamp
+        line.header.frame_id = 'map'
+        line.ns = 'mission_route'
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.scale.x = 0.2
+        line.color.r, line.color.g, line.color.b, line.color.a = 0.0, 0.5, 1.0, 0.7
+        for (lat, lon, alt) in self.mission_waypoints:
+            east, north, _up = gps_offset_enu(
+                lat, lon, alt, self.origin_lat, self.origin_lon, self.origin_alt
+            )
+            pt = Point()
+            pt.x = float(east)
+            pt.y = float(north)
+            pt.z = mission_z
+            line.points.append(pt)
+        arr.markers.append(line)
+
+        for k, (lat, lon) in enumerate(self.handoff_points):
+            east, north, _up = gps_offset_enu(
+                lat, lon, self.origin_alt, self.origin_lat, self.origin_lon, self.origin_alt
+            )
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = 'map'
+            m.ns = 'mission_handoffs'
+            m.id = k
+            m.type = Marker.CYLINDER
+            m.action = Marker.ADD
+            m.pose.position.x = float(east)
+            m.pose.position.y = float(north)
+            m.pose.position.z = mission_z / 2.0
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = 0.8
+            m.scale.z = mission_z
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.0, 0.5, 0.9
+            arr.markers.append(m)
+
+        self.mission_markers_pub.publish(arr)
 
     def _publish_circle_marker(self, did, stamp):
         """Publish a cyan LINE_STRIP circle marker for the given drone's circle_ref."""
@@ -259,6 +466,19 @@ class MultiDroneVisualizer(Node):
             pose_msg.pose.orientation.y = float(att[2])
             pose_msg.pose.orientation.z = float(att[3])
             pubs['vehicle_pose'].publish(pose_msg)
+
+            tf_msg = TransformStamped()
+            tf_msg.header.stamp = stamp
+            tf_msg.header.frame_id = 'map'
+            tf_msg.child_frame_id = f'drone_{did}_base_link'
+            tf_msg.transform.translation.x = float(pos[0])
+            tf_msg.transform.translation.y = float(pos[1])
+            tf_msg.transform.translation.z = float(pos[2])
+            tf_msg.transform.rotation.w = float(att[0])
+            tf_msg.transform.rotation.x = float(att[1])
+            tf_msg.transform.rotation.y = float(att[2])
+            tf_msg.transform.rotation.z = float(att[3])
+            self.tf_broadcaster.sendTransform(tf_msg)
 
             # Vehicle Path
             path_pt = PoseStamped()

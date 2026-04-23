@@ -1,10 +1,12 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from std_msgs.msg import String, Float64
+from std_msgs.msg import String, Float64, Bool
 from geometry_msgs.msg import Point
+from sensor_msgs.msg import NavSatFix
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from mission_interfaces.action import CircleMission
+from mission_interfaces.msg import GlobalMission, RelayStatus
 import sys, termios, tty, time, select, math
 import threading
 import json
@@ -105,6 +107,31 @@ class MissionControl(Node):
         self.circle_active = False
         self.circle_goal_handle = None
 
+        # ── Relay Mission ───────────────────────────────────────────────
+        self.declare_parameter('mission_file', '')
+        self.mission_file = self.get_parameter('mission_file').get_parameter_value().string_value
+
+        self.global_mission_pub = self.create_publisher(GlobalMission, '/swarm/global_mission', qos)
+        self.planned_gps_pub = self.create_publisher(NavSatFix, '/swarm/planned_gps', qos)
+        self.relay_interrupt_pubs = {
+            did: self.create_publisher(Bool, f'/px4_{did}/relay_interrupt', qos)
+            for did in self.ids
+        }
+        self.create_subscription(String, '/swarm/map_received', self.map_received_cb, qos)
+        self.create_subscription(RelayStatus, '/swarm/relay_status', self.relay_status_cb, qos)
+
+        self.mission_waypoints = []  # list of (lat, lon, alt)
+        self.map_ack_count = 0
+        self.relay_active_drone = 0
+        self.relay_started_drone = 0  # Track which drone was started by ground station
+        self.relay_phase = "IDLE"
+        self.relay_current_index = 0
+        self.relay_total = 0
+
+        # Load .plan file if provided
+        if self.mission_file:
+            self._load_plan_file(self.mission_file)
+
         # Background spin thread (for Action callbacks)
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
@@ -126,10 +153,20 @@ class MissionControl(Node):
         print(f"{Colors.YELLOW}[F]     網格掃描+驗證 (Scan+Verify){Colors.ENDC}")
         print(f"{Colors.YELLOW}[C]     畫圓任務 (Circle: Commander → Target){Colors.ENDC}")
         print(f"{Colors.YELLOW}[Q]     取消畫圓任務{Colors.ENDC}")
+        print(f"{Colors.GREEN}[G]     接力任務 (Relay: 廣播地圖+啟動){Colors.ENDC}")
+        print(f"{Colors.RED}[X]     中斷接力 (觸發交接給下一台){Colors.ENDC}")
+        print(f"{Colors.RED}[P]     緊急懸停 (所有無人機原地停止){Colors.ENDC}")
         print(f"[H]     匯出歷史為CSV檔案")
         print(f"[L]     降落 (Land)")
         print(f"[R]     上鎖重置 (Disarm) - 降落後必按")
         print(f"{Colors.YELLOW}[M]     手動鍵盤控制 (Manual Mode){Colors.ENDC}")
+        print(f"--------------------------------------------")
+        # Relay status
+        if self.mission_waypoints:
+            print(f"地圖: {len(self.mission_waypoints)} 航點已載入")
+        if self.relay_active_drone > 0:
+            print(f"接力: Drone {self.relay_active_drone} | {self.relay_phase} | "
+                  f"{self.relay_current_index}/{self.relay_total}")
         print(f"--------------------------------------------")
         ids_hint = "/".join(str(d) for d in self.ids)
         print(f"[{ids_hint}/5] 切換飛機 (5=全體)")
@@ -171,10 +208,6 @@ class MissionControl(Node):
                 "origin": self.scan_origin[drone_id]
             }
             self.signal_history[drone_id].append(record)
-            self.get_logger().info(
-                f"📊 Drone {drone_id} [{record['scan_phase']}] @ {record['position']}: "
-                f"{record['tracker_id']} F-SNR={record['forward_snr']:.1f} R-SNR={record['return_snr']:.1f}dB"
-            )
 
             # 若已建立 CSV 檔，寫入即時紀錄
             csv_path = self.scan_csv_paths.get(drone_id)
@@ -323,6 +356,131 @@ class MissionControl(Node):
         msg = Float64(); msg.data = float(yaw_rad)
         self.yaw_pubs[did].publish(msg)
 
+    # ── Relay Mission Functions ─────────────────────────────────────────
+
+    def _load_plan_file(self, filepath):
+        """Parse QGC .plan file and extract waypoints (command=16)."""
+        try:
+            with open(filepath, 'r') as f:
+                plan = json.load(f)
+            items = plan.get('mission', {}).get('items', [])
+            self.mission_waypoints = []
+            for item in items:
+                cmd = item.get('command', 0)
+                if cmd == 16:  # MAV_CMD_NAV_WAYPOINT
+                    params = item.get('params', [])
+                    if len(params) >= 7 and params[4] is not None and params[5] is not None:
+                        lat, lon, alt = float(params[4]), float(params[5]), float(params[6] or 0)
+                        self.mission_waypoints.append((lat, lon, alt))
+            print(f"{Colors.GREEN}>>> .plan 載入成功: {len(self.mission_waypoints)} 個航點 ({filepath}){Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}>>> .plan 載入失敗: {e}{Colors.ENDC}")
+
+    def broadcast_global_mission(self):
+        """Broadcast waypoints to all drones and publish GPS path for Foxglove."""
+        if not self.mission_waypoints:
+            print(f"{Colors.RED}>>> 無航點可廣播，請先載入 .plan 檔{Colors.ENDC}")
+            return
+
+        # Publish GlobalMission
+        msg = GlobalMission()
+        msg.mission_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        msg.waypoint_lats = [wp[0] for wp in self.mission_waypoints]
+        msg.waypoint_lons = [wp[1] for wp in self.mission_waypoints]
+        msg.waypoint_alts = [wp[2] for wp in self.mission_waypoints]
+        msg.mission_altitude = 10.0
+
+        self.map_ack_count = 0
+        # Publish multiple times to ensure delivery
+        for _ in range(5):
+            self.global_mission_pub.publish(msg)
+            time.sleep(0.1)
+
+        print(f"{Colors.GREEN}>>> GlobalMission 已廣播: {len(self.mission_waypoints)} 航點{Colors.ENDC}")
+
+        # Publish GPS waypoints for Foxglove Map panel
+        for lat, lon, alt in self.mission_waypoints:
+            nav = NavSatFix()
+            nav.latitude = lat
+            nav.longitude = lon
+            nav.altitude = alt
+            self.planned_gps_pub.publish(nav)
+
+        # Wait for ack from drones
+        print(f"等待無人機確認地圖接收...")
+        wait_start = time.time()
+        while self.map_ack_count < len(self.ids) and (time.time() - wait_start) < 10.0:
+            time.sleep(0.5)
+
+        if self.map_ack_count >= len(self.ids):
+            print(f"{Colors.GREEN}>>> 全部 {self.map_ack_count} 台無人機已確認收到地圖{Colors.ENDC}")
+        else:
+            print(f"{Colors.YELLOW}>>> {self.map_ack_count}/{len(self.ids)} 台確認（部分超時）{Colors.ENDC}")
+
+    def map_received_cb(self, msg):
+        """Count acks from drones."""
+        self.map_ack_count += 1
+
+    def relay_status_cb(self, msg: RelayStatus):
+        """Track relay progress from drones. Ignore IDLE/RELAY_IDLE states."""
+        if msg.phase in ('IDLE', 'RELAY_IDLE'):
+            return
+        self.relay_active_drone = msg.active_drone_id
+        self.relay_phase = msg.phase
+        self.relay_current_index = msg.current_index
+        self.relay_total = msg.total_waypoints
+
+    def perform_relay_start(self):
+        """Start relay mission: broadcast map, then tell drone 1 to start."""
+        if not self.mission_waypoints:
+            print(f"{Colors.RED}>>> 請先載入 .plan 檔 (啟動時 -p mission_file:=xxx){Colors.ENDC}")
+            input("按 Enter 返回...")
+            self.print_ui()
+            return
+
+        print(f"\n{Colors.YELLOW}>>> 接力任務啟動程序...{Colors.ENDC}")
+        self.broadcast_global_mission()
+
+        # Tell drone 1 to start relay
+        first_drone = self.ids[0]
+        self.relay_started_drone = first_drone
+        self.relay_active_drone = first_drone
+        msg = String(); msg.data = "START_RELAY"
+        self.action_pubs[first_drone].publish(msg)
+        print(f"{Colors.GREEN}>>> 已下令 Drone {first_drone} 開始接力任務{Colors.ENDC}")
+        print(f"按 [X] 可隨時中斷當前無人機並觸發交接")
+        time.sleep(1.0)
+        self.print_ui()
+
+    def perform_force_hover(self):
+        """Force ALL drones to stop and hover immediately."""
+        print(f"\n{Colors.RED}>>> 緊急懸停：所有無人機原地停止{Colors.ENDC}")
+        msg = String(); msg.data = "FORCE_HOVER"
+        for did in self.ids:
+            self.action_pubs[did].publish(msg)
+        # Cancel circle mission if active
+        if self.circle_active:
+            self.cancel_circle_mission()
+        # Reset relay tracking
+        self.relay_active_drone = 0
+        self.relay_started_drone = 0
+        self.relay_phase = "IDLE"
+
+    def perform_relay_interrupt(self):
+        """Interrupt the currently active relay drone."""
+        # Priority: relay_active_drone (from status) > relay_started_drone > first drone
+        active = self.relay_active_drone if self.relay_active_drone > 0 else (
+            self.relay_started_drone if self.relay_started_drone > 0 else self.ids[0])
+
+        if active not in self.relay_interrupt_pubs:
+            print(f"{Colors.RED}>>> 無法中斷: drone {active} 不在列表中{Colors.ENDC}")
+            return
+
+        msg = Bool(); msg.data = True
+        self.relay_interrupt_pubs[active].publish(msg)
+        print(f"\n{Colors.YELLOW}>>> 已發送中斷指令給 Drone {active}{Colors.ENDC}")
+        print(f">>> Drone {active} 將自動交接給下一台")
+
     # --- 手動鍵盤控制模式 ---
     def print_manual_ui(self):
         """顯示手動控制介面"""
@@ -339,9 +497,10 @@ class MissionControl(Node):
             yaw_deg = math.degrees(self.manual_yaw[did])
             print(f"  Drone {did}: [{pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f}] Yaw={yaw_deg:+.1f}°")
         print(f"--------------------------------------------")
-        print(f"[W/S] 前進/後退 (Y±)   [A/D] 左移/右移 (X±)")
-        print(f"[↑/↓] 上升/下降 (Z±)   [←/→] 偏航左/右轉")
+        print(f"[W/S] 機頭前進/後退    [A/D] 左/右平移")
+        print(f"[↑/↓] 爬升/下降        [←/→] 機頭左/右旋轉")
         print(f"[Y] 懸停 HOLD          [+/-] 調整步進")
+        print(f"{Colors.RED}[P] 緊急懸停 (所有無人機原地停止){Colors.ENDC}")
         print(f"[L] 緊急降落  [R] 緊急上鎖")
         ids_hint = "/".join(str(d) for d in self.ids)
         print(f"[{ids_hint}/5] 切換飛機")
@@ -381,24 +540,33 @@ class MissionControl(Node):
         yaw_delta = 0.0
         step = self.position_step
 
+        # Body-frame input
+        body_fwd = 0.0
+        body_right = 0.0
+        dz = 0.0
+
         if key in ('w', 'W'):
-            delta[1] = step    # 前進 +Y
+            body_fwd = step
         elif key in ('s', 'S'):
-            delta[1] = -step   # 後退 -Y
+            body_fwd = -step
         elif key in ('a', 'A'):
-            delta[0] = -step   # 左移 -X
+            body_right = -step
         elif key in ('d', 'D'):
-            delta[0] = step    # 右移 +X
+            body_right = step
         elif key == 'UP':
-            delta[2] = step    # 上升 +Z
+            dz = step
         elif key == 'DOWN':
-            delta[2] = -step   # 下降 -Z
+            dz = -step
         elif key == 'LEFT':
-            yaw_delta = -self.yaw_step  # 偏航左轉
+            yaw_delta = -self.yaw_step
         elif key == 'RIGHT':
-            yaw_delta = self.yaw_step   # 偏航右轉
+            yaw_delta = self.yaw_step
+        elif key in ('p', 'P'):
+            self.perform_force_hover()
+            self.manual_mode = False
+            self.print_ui()
+            return
         elif key in ('y', 'Y'):
-            # HOLD：重發當前 position + yaw
             for did in targets:
                 pos = self.manual_position[did]
                 self.send_setpoint_per_drone(did, pos[0], pos[1], pos[2])
@@ -416,23 +584,34 @@ class MissionControl(Node):
             self.print_manual_ui()
             return
         else:
-            return  # 未知按鍵，忽略
+            return
 
-        if delta == [0.0, 0.0, 0.0] and yaw_delta == 0.0:
+        if body_fwd == 0.0 and body_right == 0.0 and dz == 0.0 and yaw_delta == 0.0:
             return
 
         bounds = self.manual_bounds
         for did in targets:
             pos = self.manual_position[did]
-            pos[0] = max(bounds['x'][0], min(bounds['x'][1], pos[0] + delta[0]))
-            pos[1] = max(bounds['y'][0], min(bounds['y'][1], pos[1] + delta[1]))
-            pos[2] = max(bounds['z'][0], min(bounds['z'][1], pos[2] + delta[2]))
+
+            # Body-frame WASD → ENU world-frame per drone's yaw
+            if body_fwd != 0.0 or body_right != 0.0:
+                yaw = self.manual_yaw[did]
+                # ENU: X=East, Y=North. NED yaw=0 → North → ENU Y+
+                dx = body_fwd * math.sin(yaw) + body_right * math.cos(yaw)
+                dy = body_fwd * math.cos(yaw) - body_right * math.sin(yaw)
+                pos[0] = max(bounds['x'][0], min(bounds['x'][1], pos[0] + dx))
+                pos[1] = max(bounds['y'][0], min(bounds['y'][1], pos[1] + dy))
+
+            # Vertical
+            if dz != 0.0:
+                pos[2] = max(bounds['z'][0], min(bounds['z'][1], pos[2] + dz))
+
             self.send_setpoint_per_drone(did, pos[0], pos[1], pos[2])
             self.current_scan_position[did] = (pos[0], pos[1], pos[2])
 
+            # Yaw only — no position change
             if yaw_delta != 0.0:
                 self.manual_yaw[did] += yaw_delta
-                # Wrap to [-pi, pi]
                 self.manual_yaw[did] = math.atan2(math.sin(self.manual_yaw[did]), math.cos(self.manual_yaw[did]))
                 self.send_yaw_per_drone(did, self.manual_yaw[did])
 
@@ -1038,6 +1217,9 @@ def main(args=None):
                 elif key in ('f', 'F'): node.perform_grid_scan()
                 elif key in ('c', 'C'): node.perform_circle_mission()
                 elif key in ('q', 'Q'): node.cancel_circle_mission()
+                elif key in ('g', 'G'): node.perform_relay_start()
+                elif key in ('x', 'X'): node.perform_relay_interrupt()
+                elif key in ('p', 'P'): node.perform_force_hover()
                 elif key in ('h', 'H'): node.export_signal_history_csv()
                 elif key in ('l', 'L'): node.perform_land()
                 elif key in ('r', 'R'): node.perform_disarm()

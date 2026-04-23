@@ -1,0 +1,13 @@
+# Drone-to-drone relay handoff service
+# Called by interrupted drone to hand off mission to next drone
+
+# Request
+uint8 from_drone_id
+float64 handoff_lat
+float64 handoff_lon
+float64 handoff_alt        # AMSL altitude from VehicleGlobalPosition.alt
+uint32 start_index          # Next waypoint index to continue from
+---
+# Response
+bool accepted
+string reason
