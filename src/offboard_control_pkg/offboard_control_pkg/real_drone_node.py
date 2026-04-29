@@ -173,6 +173,7 @@ class DroneNode(Node):
 
         # ── Relay Mission State ─────────────────────────────────────────
         self.relay_state = 'IDLE'   # IDLE / RELAY_IDLE / RELAY_TAKEOFF / RELAY_GOTO_HANDOFF / RELAY_EXECUTING / RELAY_INTERRUPTED / RELAY_RETURNING
+        self.paused = False  # FORCE_HOVER 暫停 → state machine 不推進，按 RESUME_RELAY 解除
         self.mission_waypoints_gps = []     # list of (lat, lon, alt_amsl)
         self.mission_waypoints_ned = []     # list of (x, y, z) in local NED
         self.mission_converted = False
@@ -270,29 +271,45 @@ class DroneNode(Node):
     def action_cb(self, msg):
         cmd = msg.data.upper()
         if cmd == "TAKEOFF_CHECK":
+            self.paused = False
             self.perform_safety_takeoff()
         elif cmd == "LAND":
             self.get_logger().info(f"[{self.target_ns}] 執行降落...")
-            self.relay_state = 'IDLE'
+            # 凍結 state machine（target_pos_ned 不再被推進）但保留 relay_state
+            # → 使用者後續按 X 仍能觸發中斷+交接給下一台
+            self.paused = True
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+        elif cmd == "RETURN_HOME":
+            self.get_logger().info(f"[{self.target_ns}] *** 返航 ***")
+            self.paused = False
+            if self.relay_home_ned is None:
+                self.relay_home_ned = [0.0, 0.0, 0.0]  # fallback: 用 origin 作為 home
+            self.relay_state = 'RELAY_RETURNING'
         elif cmd == "DISARM":
             self.get_logger().info(f"[{self.target_ns}] 強制上鎖...")
+            self.paused = False
             self.relay_state = 'IDLE'
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
         elif cmd == "RESET_ORIGIN":
             self.origin_ref_ned = list(self.current_local_ned)
             self.target_yaw_ned = float('nan')
+            self.paused = False
             self.relay_state = 'IDLE'
             self.get_logger().info(f"[{self.target_ns}] 重置相對原點，relay_state=IDLE")
         elif cmd == "FORCE_HOVER":
-            self.get_logger().info(f"[{self.target_ns}] *** 緊急懸停 ***")
-            self.relay_state = 'IDLE'
-            self.external_control_active = False
+            self.get_logger().info(f"[{self.target_ns}] *** 緊急懸停（暫停接力進度） ***")
             self.target_pos_ned = list(self.current_local_ned)
             self.target_yaw_ned = float('nan')
+            self.paused = True  # 阻止 relay state machine 推進，但保留 relay_state
+            self.external_control_active = False
             if self.circle_state != 'IDLE':
                 self.circle_cancel_requested = True
+        elif cmd == "RESUME_RELAY":
+            if self.paused:
+                self.get_logger().info(f"[{self.target_ns}] *** 恢復暫停接力任務 ***")
+            self.paused = False
         elif cmd == "START_RELAY":
+            self.paused = False
             self._start_relay_mission()
 
     def scan_action_cb(self, msg):
@@ -378,6 +395,7 @@ class DroneNode(Node):
         interruptible = ('RELAY_TAKEOFF', 'RELAY_GOTO_HANDOFF', 'RELAY_EXECUTING')
         if msg.data and self.relay_state in interruptible:
             self.get_logger().info(f"[{self.target_ns}] *** 收到中斷指令 (state={self.relay_state}) ***")
+            self.paused = False  # 解除暫停讓 state machine 進入 INTERRUPTED 流程
             self.relay_state = 'RELAY_INTERRUPTED'
 
     def relay_handoff_cb(self, request, response):
@@ -536,17 +554,18 @@ class DroneNode(Node):
         if self.relay_state not in ('IDLE', 'RELAY_IDLE'):
             self._publish_relay_status()
 
-        # Relay state machine
-        if self.relay_state == 'RELAY_TAKEOFF':
-            self._handle_relay_takeoff()
-        elif self.relay_state == 'RELAY_GOTO_HANDOFF':
-            self._handle_relay_goto_handoff()
-        elif self.relay_state == 'RELAY_EXECUTING':
-            self._handle_relay_executing()
-        elif self.relay_state == 'RELAY_INTERRUPTED':
-            self._handle_relay_interrupted()
-        elif self.relay_state == 'RELAY_RETURNING':
-            self._handle_relay_returning()
+        # Relay state machine（paused 時不推進航點，target_pos_ned 維持當前位置）
+        if not self.paused:
+            if self.relay_state == 'RELAY_TAKEOFF':
+                self._handle_relay_takeoff()
+            elif self.relay_state == 'RELAY_GOTO_HANDOFF':
+                self._handle_relay_goto_handoff()
+            elif self.relay_state == 'RELAY_EXECUTING':
+                self._handle_relay_executing()
+            elif self.relay_state == 'RELAY_INTERRUPTED':
+                self._handle_relay_interrupted()
+            elif self.relay_state == 'RELAY_RETURNING':
+                self._handle_relay_returning()
 
         # Publish offboard heartbeat + setpoint (unless externally controlled)
         if not self.external_control_active:
@@ -728,10 +747,11 @@ class DroneNode(Node):
                 px, py = x, y
             msg.position = [float(px), float(py), float(z)]  # z goes directly
         else:
+            # 全部三軸都用 origin_ref_ned 偏移（修正 z 漂移導致起飛高度錯誤）
             msg.position = [
                 float(self.origin_ref_ned[0] + x),
                 float(self.origin_ref_ned[1] + y),
-                float(z)]
+                float(self.origin_ref_ned[2] + z)]
         msg.yaw = self.target_yaw_ned
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.traj_pub.publish(msg)

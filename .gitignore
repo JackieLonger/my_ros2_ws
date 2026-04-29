@@ -7,3 +7,5 @@
 /signal_log
 /missions
 /scripts
+/src/insta360_ros_driver
+/src/offboard_control_pkg/offboard_control_pkg/multi_drone_sender_old.py
