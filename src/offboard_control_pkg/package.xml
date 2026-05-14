@@ -23,6 +23,8 @@
   <depend>px4_msgs</depend>
   <depend>mission_interfaces</depend>
 
+  <test_depend>ament_pytest</test_depend>
+
   <export>
     <build_type>ament_python</build_type>
   </export>

@@ -9,3 +9,8 @@
 /scripts
 /src/insta360_ros_driver
 /src/offboard_control_pkg/offboard_control_pkg/multi_drone_sender_old.py
+/CLAUDE.md
+/src/offboard_control_pkg/test
+/src/offboard_control_pkg/offboard_control_pkg/plan_previewer.py
+/src/offboard_control_pkg/offboard_control_pkg/_plan_loader.py
+/src/offboard_control_pkg/offboard_control_pkg/__pycache__

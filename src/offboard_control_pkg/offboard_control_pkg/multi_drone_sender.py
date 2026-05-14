@@ -8,7 +8,7 @@ multi_drone_sender.py — 乾淨測試版（手動模式 + 接力模式）
   Space  恢復暫停的接力（從原地繼續飛剩餘航點）
   X  中斷當前接力機（觸發交接給下一台）
   P  緊急原地懸停（暫停，不清除接力進度）
-  L  降落
+  B  降落
   R  上鎖 (Disarm)
   M  進入手動模式
   1/2/3/5 切機（5=全體）
@@ -27,8 +27,9 @@ from rclpy.node import Node
 from std_msgs.msg import String, Float64, Bool
 from geometry_msgs.msg import Point
 from sensor_msgs.msg import NavSatFix
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from mission_interfaces.msg import GlobalMission, RelayStatus
+from px4_msgs.msg import VehicleLocalPosition
 import sys, termios, tty, time, select, math
 import threading
 import json
@@ -69,15 +70,29 @@ class MissionControl(Node):
         self.yaw_step = 0.2  # ~11.5°
         self.manual_bounds = {'x': (-20.0, 20.0), 'y': (-20.0, 20.0), 'z': (1.0, 15.0)}
 
+        # --- Per-drone live telemetry (來自 PX4 vehicle_local_position) ---
+        self.drone_heading = {did: None for did in self.ids}  # rad, NED yaw (0=北, 順時針正)
+        self.drone_alt = {did: None for did in self.ids}      # m, 相對 EKF origin 高度（正=向上）
+
         # --- Publishers / Subscribers ---
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        px4_sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
         self.action_pubs = {}
         self.setpoint_pubs = {}
         self.yaw_pubs = {}
+        self.local_pos_subs = {}
         for did in self.ids:
             self.action_pubs[did] = self.create_publisher(String, f'/px4_{did}/laptop/action', qos)
             self.setpoint_pubs[did] = self.create_publisher(Point, f'/px4_{did}/laptop/setpoint', qos)
             self.yaw_pubs[did] = self.create_publisher(Float64, f'/px4_{did}/laptop/yaw_setpoint', qos)
+            self.local_pos_subs[did] = self.create_subscription(
+                VehicleLocalPosition,
+                f'/px4_{did}/fmu/out/vehicle_local_position',
+                lambda msg, d=did: self._on_local_pos(d, msg),
+                px4_sub_qos)
 
         # --- Relay mission ---
         self.global_mission_pub = self.create_publisher(GlobalMission, '/swarm/global_mission', qos)
@@ -125,7 +140,7 @@ class MissionControl(Node):
         print(f"{Colors.RED}[X]      中斷接力 (觸發交接給下一台){Colors.ENDC}")
         print(f"{Colors.RED}[P]      原地懸停（暫停，不清進度）{Colors.ENDC}")
         print(f"{Colors.YELLOW}[H]      返航 (Return Home){Colors.ENDC}")
-        print(f"[L]      降落 (Land)")
+        print(f"[B]      降落 (Land)")
         print(f"[R]      上鎖 (Disarm) - 降落後必按")
         print(f"{Colors.YELLOW}[M]      手動鍵盤控制 (Manual Mode){Colors.ENDC}")
         print(f"--------------------------------------------")
@@ -172,17 +187,9 @@ class MissionControl(Node):
     # ────────────────────────────────────────────────────────────
     def _load_plan_file(self, filepath):
         """Parse QGC .plan file, extract MAV_CMD_NAV_WAYPOINT (cmd=16)."""
+        from offboard_control_pkg._plan_loader import load_qgc_plan
         try:
-            with open(filepath, 'r') as f:
-                plan = json.load(f)
-            items = plan.get('mission', {}).get('items', [])
-            self.mission_waypoints = []
-            for item in items:
-                if item.get('command', 0) == 16:
-                    params = item.get('params', [])
-                    if len(params) >= 7 and params[4] is not None and params[5] is not None:
-                        lat, lon, alt = float(params[4]), float(params[5]), float(params[6] or 0)
-                        self.mission_waypoints.append((lat, lon, alt))
+            self.mission_waypoints = load_qgc_plan(filepath)
             print(f"{Colors.GREEN}>>> .plan 載入成功: {len(self.mission_waypoints)} 個航點{Colors.ENDC}")
         except Exception as e:
             print(f"{Colors.RED}>>> .plan 載入失敗: {e}{Colors.ENDC}")
@@ -219,6 +226,16 @@ class MissionControl(Node):
 
     def map_received_cb(self, msg):
         self.map_ack_count += 1
+
+    def _on_local_pos(self, did, msg):
+        """PX4 VehicleLocalPosition callback：更新該機即時 heading 與相對高度。"""
+        if msg.heading_good_for_control:
+            self.drone_heading[did] = float(msg.heading)
+        # NED z 為負代表向上；轉成正向上的高度
+        try:
+            self.drone_alt[did] = -float(msg.z)
+        except Exception:
+            pass
 
     def relay_status_cb(self, msg: RelayStatus):
         if msg.phase in ('IDLE', 'RELAY_IDLE'):
@@ -260,9 +277,9 @@ class MissionControl(Node):
     def perform_force_hover(self):
         """原地懸停：依 target_mode（單機或全體）發 FORCE_HOVER。
         drone 端設 paused=True，懸停在當前位置；relay_state 保留。
-        可後續按 Space 恢復、X 交接、L 降落、H 返航、R 上鎖。"""
+        可後續按 Space 恢復、X 交接、B 降落、H 返航、R 上鎖。"""
         target_str = "全體" if self.target_mode == "ALL" else f"Drone {self.target_mode}"
-        print(f"\n{Colors.RED}>>> {target_str} 原地懸停（暫停） — 按 Space 恢復、X 交接、L 降落、H 返航{Colors.ENDC}")
+        print(f"\n{Colors.RED}>>> {target_str} 原地懸停（暫停） — 按 Space 恢復、X 交接、B 降落、H 返航{Colors.ENDC}")
         self.send_action("FORCE_HOVER")
         if self.manual_mode:
             self.manual_mode = False
@@ -287,17 +304,35 @@ class MissionControl(Node):
     # 起飛 / 降落 / 上鎖
     # ────────────────────────────────────────────────────────────
     def perform_takeoff(self):
-        print(f"\n{Colors.YELLOW}>>> 執行起飛程序...{Colors.ENDC}")
+        """起飛：已在起飛高度（±1 m 容差）的飛機跳過，避免被吸回 (0,0,5)。"""
         targets = self.ids if self.target_mode == "ALL" else [self.target_mode]
-        self.send_action("RESET_ORIGIN")
-        self.send_action("TAKEOFF_CHECK")
-        time.sleep(0.5)
-        self.send_setpoint(0.0, 0.0, self.takeoff_height)
-        # 同步手動模式內部位置（即使現在不在手動，下次進手動會用 enter_manual_mode 再覆寫）
+        tol = 1.0
+        needs_takeoff = []
         for did in targets:
+            alt = self.drone_alt.get(did)
+            if alt is not None and alt >= (self.takeoff_height - tol):
+                print(f"[INFO] drone {did} 已在起飛高度 ({alt:.1f} m)，跳過起飛")
+                continue
+            needs_takeoff.append(did)
+        if not needs_takeoff:
+            print(f"[INFO] 所有目標皆已在起飛高度，不執行起飛")
+            return
+        print(f"\n{Colors.YELLOW}>>> 執行起飛程序 (targets={needs_takeoff})...{Colors.ENDC}")
+        for did in needs_takeoff:
+            msg = String(); msg.data = "RESET_ORIGIN"
+            self.action_pubs[did].publish(msg)
+        for did in needs_takeoff:
+            msg = String(); msg.data = "TAKEOFF_CHECK"
+            self.action_pubs[did].publish(msg)
+        time.sleep(0.5)
+        for did in needs_takeoff:
+            self.send_setpoint_per_drone(did, 0.0, 0.0, self.takeoff_height)
             self.manual_position[did] = [0.0, 0.0, self.takeoff_height]
-            self.manual_yaw[did] = 0.0
-        print(f">>> 指令已發送，等待無人機爬升至懸停高度 ({self.takeoff_height} m)...")
+            # 同步 manual_yaw 為當下實際 heading（與 Fix 1 一致）
+            self.manual_yaw[did] = (
+                self.drone_heading[did] if self.drone_heading[did] is not None else 0.0
+            )
+        print(f">>> 起飛指令已發送 (targets={needs_takeoff})，等待爬升至 {self.takeoff_height} m...")
 
     def perform_land(self):
         print(f"\n{Colors.RED}>>> 執行降落...{Colors.ENDC}")
@@ -352,8 +387,12 @@ class MissionControl(Node):
         for did in targets:
             self.send_setpoint_per_drone(did, 0.0, 0.0, self.takeoff_height)
             self.manual_position[did] = [0.0, 0.0, self.takeoff_height]
-            self.manual_yaw[did] = 0.0
-            self.send_yaw_per_drone(did, 0.0)
+            # 以當下實際 heading 作為 manual_yaw 起點；body-frame 轉換用 drone_heading（即時值），
+            # manual_yaw 僅供 J/L 鍵下達 yaw 目標時累加。
+            self.manual_yaw[did] = (
+                self.drone_heading[did] if self.drone_heading[did] is not None else 0.0
+            )
+            # 不送 yaw setpoint，drone 保持當前 heading（避免進手動時被強制旋轉到正北）
         self.print_manual_ui()
 
     def handle_manual_key(self, key):
@@ -412,8 +451,12 @@ class MissionControl(Node):
         for did in targets:
             pos = self.manual_position[did]
             if body_fwd != 0.0 or body_right != 0.0:
-                yaw = self.manual_yaw[did]
-                # ENU: X=East, Y=North. NED yaw=0 → North → ENU Y+
+                # body→ENU 用即時 heading（NED yaw, 0=北/順時針正），避免和實際機頭脫鉤。
+                # 若 heading 尚未就緒，退回世界座標並警告（一次性）。
+                yaw = self.drone_heading[did]
+                if yaw is None:
+                    print(f"[WARN] drone {did} heading 未就緒，本次 WASD 退回世界座標 (yaw=0)")
+                    yaw = 0.0
                 dx = body_fwd * math.sin(yaw) + body_right * math.cos(yaw)
                 dy = body_fwd * math.cos(yaw) - body_right * math.sin(yaw)
                 pos[0] = max(bounds['x'][0], min(bounds['x'][1], pos[0] + dx))
@@ -522,7 +565,7 @@ def main(args=None):
                 elif key in ('x', 'X'): node.perform_relay_interrupt()
                 elif key in ('p', 'P'): node.perform_force_hover()
                 elif key in ('h', 'H'): node.perform_return_home()
-                elif key in ('l', 'L'): node.perform_land()
+                elif key in ('b', 'B'): node.perform_land()
                 elif key in ('r', 'R'): node.perform_disarm()
     except KeyboardInterrupt:
         pass

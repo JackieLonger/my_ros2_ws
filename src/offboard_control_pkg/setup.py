@@ -30,6 +30,7 @@ setup(
             'swarm_controller = offboard_control_pkg.swarm_controller:main',
             "voice_commander = offboard_control_pkg.voice_commander:main",
             'multi_drone_visualizer = offboard_control_pkg.multi_drone_visualizer:main',
+            'plan_previewer = offboard_control_pkg.plan_previewer:main',
         ],
     },
 )

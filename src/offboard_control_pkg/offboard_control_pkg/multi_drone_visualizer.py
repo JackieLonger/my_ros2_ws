@@ -8,6 +8,7 @@ multi_drone_visualizer.py - 多機 RViz2 軌跡視覺化（GPS 共同參考框�
 """
 
 import math
+from datetime import datetime
 import numpy as np
 
 import rclpy
@@ -23,6 +24,21 @@ from visualization_msgs.msg import Marker, MarkerArray
 from mission_interfaces.msg import GlobalMission, RelayStatus
 from tf2_ros import TransformBroadcaster
 import json
+
+
+# Maps RelayStatus.phase strings to the 4 Map-panel state buckets used for
+# per-drone NavSatFix color coding. See multi_drone_visualizer.py docstring
+# and the Foxglove layout description.
+_PHASE_TO_STATE = {
+    'IDLE': 'waiting',
+    'RELAY_IDLE': 'waiting',
+    'RELAY_TAKEOFF': 'flying',
+    'RELAY_GOTO_HANDOFF': 'flying',
+    'RELAY_EXECUTING': 'flying',
+    'RELAY_INTERRUPTED': 'interrupted',
+    'RELAY_RETURNING': 'returning',
+}
+_STATE_NAMES = ('waiting', 'flying', 'interrupted', 'returning')
 
 
 def gps_offset_enu(ref_lat, ref_lon, ref_alt, lat0, lon0, alt0):
@@ -83,6 +99,8 @@ class MultiDroneVisualizer(Node):
         # 每架無人機獨立狀態與 publisher
         self.drones = {}
         self.pubs = {}
+        self.state_pubs = {}            # did -> {state_name: navsat publisher}
+        self.phase_per_drone = {did: 'IDLE' for did in self.ids}
 
         for did in self.ids:
             ns = f'/px4_{did}'
@@ -106,6 +124,15 @@ class MultiDroneVisualizer(Node):
                 'vehicle_velocity': self.create_publisher(Marker, f'{viz_ns}/vehicle_velocity', 10),
                 'circle_reference': self.create_publisher(Marker, f'{viz_ns}/circle_reference', 10),
                 'navsat': self.create_publisher(NavSatFix, f'{viz_ns}/navsat', 10),
+            }
+            # Phase-aware NavSatFix split — Foxglove Map panel colors by topic,
+            # so we publish the same GPS fix to one of four sub-topics depending
+            # on the drone's current relay phase.
+            self.state_pubs[did] = {
+                state: self.create_publisher(
+                    NavSatFix, f'{viz_ns}/navsat_state/{state}', 10
+                )
+                for state in _STATE_NAMES
             }
 
             # 訂閱
@@ -155,6 +182,23 @@ class MultiDroneVisualizer(Node):
         self.progress_pub = self.create_publisher(
             String, '/multi_drone_viz/mission/progress', latched_qos
         )
+
+        # Densified planned-route NavSatFix stream — Foxglove Map panel accumulates
+        # history per topic, so cycling through interpolated points at 10 Hz draws
+        # the route as a virtual dotted line on the map.
+        dense_qos = QoSProfile(
+            depth=200,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.planned_dense_pub = self.create_publisher(
+            NavSatFix, '/multi_drone_viz/mission/planned_route_dense', dense_qos
+        )
+        self._dense_points = []           # list of (lat, lon, alt)
+        self._dense_cycle_idx = 0
+        self._dense_interior = 20         # samples between each consecutive WP pair
+        self.create_timer(0.1, self._tick_planned_route_dense)
 
         self.create_subscription(
             GlobalMission, '/swarm/global_mission', self.global_mission_cb, cmd_qos
@@ -243,6 +287,8 @@ class MultiDroneVisualizer(Node):
         fix.altitude = float(msg.alt)
         fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
         self.pubs[did]['navsat'].publish(fix)
+        state = _PHASE_TO_STATE.get(self.phase_per_drone.get(did, 'IDLE'), 'waiting')
+        self.state_pubs[did][state].publish(fix)
 
     def global_mission_cb(self, msg: GlobalMission):
         """Receive planned mission, publish each waypoint as latched NavSatFix and 3D markers."""
@@ -274,6 +320,7 @@ class MultiDroneVisualizer(Node):
             self.mission_wpt_publishers[k].publish(fix)
 
         self._publish_mission_markers()
+        self._rebuild_dense_route()
         self.get_logger().info(
             f"[MISSION] id={msg.mission_id} waypoints={n} altitude={msg.mission_altitude:.1f}m"
         )
@@ -287,6 +334,8 @@ class MultiDroneVisualizer(Node):
 
         self.active_drone_id = drone
         self.current_waypoint_index = idx
+        if drone in self.phase_per_drone:
+            self.phase_per_drone[drone] = phase
 
         progress = String()
         progress.data = f"Drone {drone} | WP {idx}/{total} | {phase}"
@@ -298,25 +347,27 @@ class MultiDroneVisualizer(Node):
         # Handoff detection: edge-triggered on entering RELAY_INTERRUPTED
         prev = self.prev_phase_per_drone.get(drone)
         if phase == 'RELAY_INTERRUPTED' and prev != 'RELAY_INTERRUPTED':
-            self._record_handoff(msg.current_lat, msg.current_lon)
+            self._record_handoff(msg.current_lat, msg.current_lon, drone)
         self.prev_phase_per_drone[drone] = phase
 
-    def _record_handoff(self, lat: float, lon: float):
+    def _record_handoff(self, lat: float, lon: float, from_did: int):
         """Store a handoff point and publish it as a latched NavSatFix."""
         k = len(self.handoff_points)
-        self.handoff_points.append((float(lat), float(lon)))
+        stamp_msg = self.get_clock().now().to_msg()
+        stamp_sec = stamp_msg.sec + stamp_msg.nanosec * 1e-9
+        self.handoff_points.append((float(lat), float(lon), int(from_did), float(stamp_sec)))
         pub = self.create_publisher(
             NavSatFix, f'/multi_drone_viz/handoffs/point_{k}', self._latched_qos
         )
         self.handoff_publishers.append(pub)
         fix = NavSatFix()
-        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.stamp = stamp_msg
         fix.header.frame_id = 'map'
         fix.latitude = float(lat)
         fix.longitude = float(lon)
         fix.altitude = 0.0
         pub.publish(fix)
-        self.get_logger().info(f"[HANDOFF] #{k} at ({lat:.7f}, {lon:.7f})")
+        self.get_logger().info(f"[HANDOFF] #{k} D{from_did} at ({lat:.7f}, {lon:.7f})")
 
     def _publish_mission_markers(self):
         """MarkerArray for 3D panel: waypoints spheres + route line + handoff markers.
@@ -372,7 +423,7 @@ class MultiDroneVisualizer(Node):
             line.points.append(pt)
         arr.markers.append(line)
 
-        for k, (lat, lon) in enumerate(self.handoff_points):
+        for k, (lat, lon, from_did, stamp_sec) in enumerate(self.handoff_points):
             east, north, _up = gps_offset_enu(
                 lat, lon, self.origin_alt, self.origin_lat, self.origin_lon, self.origin_alt
             )
@@ -392,7 +443,63 @@ class MultiDroneVisualizer(Node):
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.0, 0.5, 0.9
             arr.markers.append(m)
 
+            label = Marker()
+            label.header.stamp = stamp
+            label.header.frame_id = 'map'
+            label.ns = 'mission_handoffs'
+            label.id = k + 1000
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = float(east)
+            label.pose.position.y = float(north)
+            label.pose.position.z = mission_z + 1.2
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.8
+            label.color.r = label.color.g = label.color.b = 1.0
+            label.color.a = 1.0
+            label.text = f"#{k}  D{from_did}  {datetime.fromtimestamp(stamp_sec).strftime('%H:%M:%S')}"
+            arr.markers.append(label)
+
         self.mission_markers_pub.publish(arr)
+
+    def _rebuild_dense_route(self):
+        """Recompute densified planned-route points (linear interp between WPs).
+        Resets the cycling index so the Map panel can refresh."""
+        self._dense_points = []
+        self._dense_cycle_idx = 0
+        wps = self.mission_waypoints
+        if not wps:
+            return
+        if len(wps) == 1:
+            self._dense_points = [tuple(wps[0])]
+            return
+        n = self._dense_interior
+        for i in range(len(wps) - 1):
+            lat0, lon0, alt0 = wps[i]
+            lat1, lon1, alt1 = wps[i + 1]
+            for s in range(n + 1):
+                t = s / (n + 1)
+                self._dense_points.append((
+                    lat0 + (lat1 - lat0) * t,
+                    lon0 + (lon1 - lon0) * t,
+                    alt0 + (alt1 - alt0) * t,
+                ))
+        self._dense_points.append(tuple(wps[-1]))
+
+    def _tick_planned_route_dense(self):
+        """Publish one densified NavSatFix per tick, cycling through the buffer."""
+        if not self._dense_points:
+            return
+        lat, lon, alt = self._dense_points[self._dense_cycle_idx % len(self._dense_points)]
+        fix = NavSatFix()
+        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.frame_id = 'map'
+        fix.latitude = float(lat)
+        fix.longitude = float(lon)
+        fix.altitude = float(alt)
+        fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+        self.planned_dense_pub.publish(fix)
+        self._dense_cycle_idx += 1
 
     def _publish_circle_marker(self, did, stamp):
         """Publish a cyan LINE_STRIP circle marker for the given drone's circle_ref."""

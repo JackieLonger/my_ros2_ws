@@ -50,6 +50,13 @@ def gps_to_local_ned(target_lat, target_lon, target_alt, ref_lat, ref_lon, ref_a
     return (north, east, -up)  # ENU → NED
 
 
+# ─── PX4 v1.14 nav_state 編號（vehicle_status.msg） ──────────────────────────
+NAV_STATE_AUTO_RTL      = 5
+NAV_STATE_AUTO_LAND     = 18
+NAV_STATE_AUTO_PRECLAND = 20
+NAV_STATES_LANDING = {NAV_STATE_AUTO_LAND, NAV_STATE_AUTO_PRECLAND, NAV_STATE_AUTO_RTL}
+
+
 # ─── Main Node ──────────────────────────────────────────────────────────────
 
 class DroneNode(Node):
@@ -171,6 +178,10 @@ class DroneNode(Node):
         self.scan_completed = False
         self.status_check_count = 0
 
+        # ── Landing watchdog ────────────────────────────────────────────
+        self.landing = False        # True 期間停送 offboard heartbeat/setpoint，讓 PX4 AUTO.LAND 自行完成
+        self.nav_state = 0          # 追蹤 vehicle_status.nav_state，watchdog 用
+
         # ── Relay Mission State ─────────────────────────────────────────
         self.relay_state = 'IDLE'   # IDLE / RELAY_IDLE / RELAY_TAKEOFF / RELAY_GOTO_HANDOFF / RELAY_EXECUTING / RELAY_INTERRUPTED / RELAY_RETURNING
         self.paused = False  # FORCE_HOVER 暫停 → state machine 不推進，按 RESUME_RELAY 解除
@@ -220,12 +231,49 @@ class DroneNode(Node):
     def status_cb(self, msg):
         self.pre_flight_checks_pass = msg.pre_flight_checks_pass
         self.is_connected = True
+        prev_arming = self.arming_state
         try:
             self.arming_state = int(msg.arming_state)
             if hasattr(msg, 'system_id') and msg.system_id > 0:
                 self.px4_system_id = int(msg.system_id)
         except Exception:
             pass
+
+        # Landing 期間若 PX4 自動 disarm（COM_DISARM_LAND 觸地完成）→ 清旗標、回 IDLE。
+        # 這條要先於下面的 watchdog，避免 nav_state 隨後回到 OFFBOARD 被誤判為 RC override。
+        if self.landing and prev_arming == 2 and self.arming_state == 1:
+            self.landing = False
+            self.relay_state = 'IDLE'
+            self.get_logger().info(f"[{self.target_ns}] AUTO.LAND 完成，PX4 已自動上鎖")
+
+        # Watchdog: 仍在 landing 期間且仍 ARMED 但 nav_state 跳出 AUTO_LAND/PRECLAND/RTL，
+        # 多半是 RC stick override 把 PX4 拉回 POSCTL，記錄警告；若已接近地面 (<1 m)
+        # 自動 disarm，免得在地上抽搐。
+        try:
+            prev_nav = self.nav_state
+            self.nav_state = int(msg.nav_state)
+            if (self.landing
+                    and self.arming_state == 2
+                    and prev_nav in NAV_STATES_LANDING
+                    and self.nav_state not in NAV_STATES_LANDING):
+                self.get_logger().warn(
+                    f"[{self.target_ns}] AUTO.LAND 被中斷 "
+                    f"(nav_state {prev_nav}→{self.nav_state})，"
+                    f"可能是 RC stick override；如已觸地請按 R disarm")
+                try:
+                    alt_above_origin = -(self.current_local_ned[2] - self.origin_ref_ned[2])
+                except Exception:
+                    alt_above_origin = 99.0
+                if alt_above_origin < 1.0:
+                    self.get_logger().warn(
+                        f"[{self.target_ns}] 已在地面附近 (alt={alt_above_origin:.2f} m)，自動 DISARM")
+                    self.publish_vehicle_command(
+                        VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
+                    self.landing = False
+                    self.relay_state = 'IDLE'
+        except Exception:
+            pass
+
         self.status_check_count += 1
         if self.status_check_count % 40 == 0:
             armed_str = "ARMED" if self.arming_state == 2 else "DISARMED"
@@ -272,28 +320,33 @@ class DroneNode(Node):
         cmd = msg.data.upper()
         if cmd == "TAKEOFF_CHECK":
             self.paused = False
+            self.landing = False
             self.perform_safety_takeoff()
         elif cmd == "LAND":
             self.get_logger().info(f"[{self.target_ns}] 執行降落...")
             # 凍結 state machine（target_pos_ned 不再被推進）但保留 relay_state
             # → 使用者後續按 X 仍能觸發中斷+交接給下一台
             self.paused = True
+            self.landing = True
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         elif cmd == "RETURN_HOME":
             self.get_logger().info(f"[{self.target_ns}] *** 返航 ***")
             self.paused = False
+            self.landing = False
             if self.relay_home_ned is None:
                 self.relay_home_ned = [0.0, 0.0, 0.0]  # fallback: 用 origin 作為 home
             self.relay_state = 'RELAY_RETURNING'
         elif cmd == "DISARM":
             self.get_logger().info(f"[{self.target_ns}] 強制上鎖...")
             self.paused = False
+            self.landing = False
             self.relay_state = 'IDLE'
             self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
         elif cmd == "RESET_ORIGIN":
             self.origin_ref_ned = list(self.current_local_ned)
             self.target_yaw_ned = float('nan')
             self.paused = False
+            self.landing = False
             self.relay_state = 'IDLE'
             self.get_logger().info(f"[{self.target_ns}] 重置相對原點，relay_state=IDLE")
         elif cmd == "FORCE_HOVER":
@@ -301,6 +354,7 @@ class DroneNode(Node):
             self.target_pos_ned = list(self.current_local_ned)
             self.target_yaw_ned = float('nan')
             self.paused = True  # 阻止 relay state machine 推進，但保留 relay_state
+            self.landing = False
             self.external_control_active = False
             if self.circle_state != 'IDLE':
                 self.circle_cancel_requested = True
@@ -308,8 +362,10 @@ class DroneNode(Node):
             if self.paused:
                 self.get_logger().info(f"[{self.target_ns}] *** 恢復暫停接力任務 ***")
             self.paused = False
+            self.landing = False
         elif cmd == "START_RELAY":
             self.paused = False
+            self.landing = False
             self._start_relay_mission()
 
     def scan_action_cb(self, msg):
@@ -567,8 +623,10 @@ class DroneNode(Node):
             elif self.relay_state == 'RELAY_RETURNING':
                 self._handle_relay_returning()
 
-        # Publish offboard heartbeat + setpoint (unless externally controlled)
-        if not self.external_control_active:
+        # Publish offboard heartbeat + setpoint (unless externally controlled or landing)
+        # landing=True 期間停送，讓 PX4 AUTO.LAND 自行完成 + COM_DISARM_LAND 自動上鎖；
+        # 也避免 offboard setpoint 跟 land 控制器互打。
+        if not self.external_control_active and not self.landing:
             self.publish_offboard_control_mode()
             self.publish_trajectory_setpoint(
                 self.target_pos_ned[0], self.target_pos_ned[1], self.target_pos_ned[2])
